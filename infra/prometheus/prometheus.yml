@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "api"
+    static_configs:
+      - targets: ["api:8001"]
+    metrics_path: /metrics
+
+  - job_name: "monitoring"
+    static_configs:
+      - targets: ["monitoring:8002"]
+    metrics_path: /metrics
+
+  - job_name: "data-validation"
+    static_configs:
+      - targets: ["data-validation:8003"]
+    metrics_path: /metrics
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,263 @@
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  mlflow-artifacts:
+  prometheus-data:
+  grafana-data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVICES
+# Default startup (no profile):  docker-compose up
+# Run training job:              docker-compose --profile training run --rm training
+# Run feast materialization:     docker-compose --profile feast run --rm feast
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ── Databases ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-readmission}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MLflow tracking server ───────────────────────────────────────────────────
+  mlflow:
+    build:
+      context: ./mlflow
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-readmission}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-readmission}
+      ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Inference API (FastAPI + SHAP) ───────────────────────────────────────────
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+      MODEL_NAME: ${MODEL_NAME:-readmission-xgboost}
+      MODEL_STAGE: ${MODEL_STAGE:-Production}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-prod}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+    ports:
+      - "8001:8001"
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Evidently monitoring service ─────────────────────────────────────────────
+  monitoring:
+    build:
+      context: ./services/monitoring
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+    ports:
+      - "8002:8002"
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - ./services/monitoring/reports:/app/reports
+
+  # ── Data validation service (Great Expectations) ─────────────────────────────
+  data-validation:
+    build:
+      context: ./services/data_validation
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+    ports:
+      - "8003:8003"
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data/validation:/app/expectations
+
+  # ── React frontend ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    networks:
+      - app-network
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Nginx reverse proxy (public entrypoint) ──────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+    depends_on:
+      - frontend
+      - api
+      - monitoring
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - app-network
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - app-network
+    depends_on:
+      - prometheus
+
+  # ── Feast materialization (one-off, profile-gated) ───────────────────────────
+  feast:
+    build:
+      context: ./feature_store
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+      REDIS_HOST: redis
+    volumes:
+      - ./data/processed:/data/processed:ro
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles:
+      - feast
+
+  # ── Training job (one-off, profile-gated, GPU-enabled) ───────────────────────
+  training:
+    build:
+      context: ./training
+      dockerfile: Dockerfile
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-readmission}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-readmission}
+      REDIS_HOST: redis
+    volumes:
+      - ./data:/data
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    profiles:
+      - training

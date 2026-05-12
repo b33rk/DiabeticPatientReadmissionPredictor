@@ -1,0 +1,38 @@
+model:
+  name: readmission-xgboost
+  stage: Production
+  promotion_threshold: 0.005   # new AUC must beat current Production by this margin
+
+xgboost:
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  scale_pos_weight: 3.2        # handles class imbalance (non-readmitted >> readmitted)
+  tree_method: gpu_hist        # uses P100 GPU
+  use_label_encoder: false
+  eval_metric: auc
+
+data:
+  raw_path: /data/raw/diabetic_data.csv
+  processed_path: /data/processed/features.parquet
+  test_size: 0.2
+  val_size: 0.1
+  random_seed: 42
+
+smote:
+  enabled: true
+  random_state: 42
+  k_neighbors: 5
+
+optuna:
+  enabled: false               # set to true to run hyperparameter search
+  n_trials: 50
+  timeout: 3600
+
+mlflow:
+  experiment_name: readmission-prediction
+  run_tags:
+    team: ml-engineering
+    dataset: uci-diabetic

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: readmission-config
+  namespace: readmission
+data:
+  POSTGRES_DB: "readmission"
+  POSTGRES_USER: "readmission"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  MODEL_NAME: "readmission-xgboost"
+  MODEL_STAGE: "Production"
+  POSTGRES_HOST: "postgres-service"

@@ -1,0 +1,129 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "report/**"
+      - "*.md"
+
+env:
+  REGISTRY: ghcr.io
+  ORG: ${{ github.repository_owner }}
+
+jobs:
+  # ── Build and push all images ─────────────────────────────────────────────────
+  build-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - service: api
+            context: ./services/api
+          - service: monitoring
+            context: ./services/monitoring
+          - service: data-validation
+            context: ./services/data_validation
+          - service: frontend
+            context: ./frontend
+          - service: mlflow
+            context: ./mlflow
+          - service: training
+            context: ./training
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          # Tag with both the commit SHA (immutable) and 'latest' (rolling)
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/readmission-${{ matrix.service }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.ORG }}/readmission-${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Deploy to K3s ─────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to K3s
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # The server's kubeconfig is stored as a GitHub secret.
+      # Generate with: cat /etc/rancher/k3s/k3s.yaml | base64
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Apply namespace and config
+        run: |
+          kubectl apply -f infra/k8s/namespace.yaml
+          kubectl apply -f infra/k8s/configmap.yaml
+
+      - name: Apply secrets
+        # Secrets are injected from GitHub repository secrets, not from the file
+        run: |
+          kubectl create secret generic readmission-secrets \
+            --from-literal=POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }} \
+            --from-literal=SECRET_KEY=${{ secrets.SECRET_KEY }} \
+            --from-literal=ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }} \
+            --from-literal=GRAFANA_PASSWORD=${{ secrets.GRAFANA_PASSWORD }} \
+            --namespace=readmission \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy infrastructure (postgres, redis, mlflow)
+        run: |
+          kubectl apply -f infra/k8s/postgres-statefulset.yaml
+          kubectl apply -f infra/k8s/redis-deployment.yaml
+          kubectl apply -f infra/k8s/mlflow-deployment.yaml
+          kubectl rollout status statefulset/postgres -n readmission --timeout=120s
+
+      - name: Deploy application services
+        run: |
+          # Update image tags to the current commit SHA for immutability
+          sed -i "s|:latest|:${{ github.sha }}|g" infra/k8s/api-deployment.yaml
+          sed -i "s|:latest|:${{ github.sha }}|g" infra/k8s/frontend-deployment.yaml
+          sed -i "s|:latest|:${{ github.sha }}|g" infra/k8s/monitoring-deployment.yaml
+          kubectl apply -f infra/k8s/api-deployment.yaml
+          kubectl apply -f infra/k8s/frontend-deployment.yaml
+          kubectl apply -f infra/k8s/monitoring-deployment.yaml
+          kubectl apply -f infra/k8s/ingress.yaml
+
+      - name: Apply training CronJob
+        run: kubectl apply -f infra/k8s/training-cronjob.yaml
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/api -n readmission --timeout=180s
+          kubectl rollout status deployment/frontend -n readmission --timeout=60s
+          kubectl rollout status deployment/monitoring -n readmission --timeout=60s
+
+      - name: Smoke test
+        run: |
+          # Wait for ingress to be ready, then hit the health endpoint
+          sleep 10
+          SERVER_IP="${{ secrets.SERVER_IP }}"
+          curl -sf http://$SERVER_IP/api/health || exit 1
+          echo "Smoke test passed"

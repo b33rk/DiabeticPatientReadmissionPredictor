@@ -1,0 +1,55 @@
+# Runs on a schedule (weekly) or triggered manually / by CI (ct.yml workflow).
+# kubectl create job --from=cronjob/training-job manual-train-$(date +%s) -n readmission
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: training-job
+  namespace: readmission
+spec:
+  schedule: "0 2 * * 0"  # Every Sunday at 02:00 UTC
+  concurrencyPolicy: Forbid  # Don't allow overlapping training runs
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: training
+              image: ghcr.io/YOUR_ORG/readmission-training:latest
+              envFrom:
+                - configMapRef:
+                    name: readmission-config
+              env:
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: readmission-secrets
+                      key: POSTGRES_PASSWORD
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+              resources:
+                requests:
+                  memory: "4Gi"
+                  cpu: "2000m"
+                limits:
+                  memory: "16Gi"
+                  cpu: "8000m"
+              # GPU access (P100 node)
+              # Requires nvidia device plugin deployed on K3s node
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: data-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-pvc
+  namespace: readmission
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 50Gi

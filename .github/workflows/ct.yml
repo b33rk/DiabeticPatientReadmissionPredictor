@@ -1,0 +1,153 @@
+name: Continuous training
+
+on:
+  # Trigger manually from GitHub UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for triggering retraining"
+        required: false
+        default: "Manual trigger"
+
+  # Poll PostgreSQL every 6 hours to check if enough new data has accumulated
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: "0 2 * * 0"     # weekly fallback (Sunday 02:00 UTC)
+
+env:
+  # Minimum new predictions since last training run before retraining is triggered
+  NEW_DATA_THRESHOLD: 500
+
+jobs:
+  # ── Check if enough new data exists in PostgreSQL ────────────────────────────
+  check-new-data:
+    name: Check new data in PostgreSQL
+    runs-on: ubuntu-latest
+    # Skip this check on manual trigger — always train
+    if: github.event_name != 'workflow_dispatch'
+    outputs:
+      should_train: ${{ steps.check.outputs.should_train }}
+      new_row_count: ${{ steps.check.outputs.new_row_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install psycopg2
+        run: pip install psycopg2-binary
+
+      - name: Check new prediction rows since last training
+        id: check
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          NEW_DATA_THRESHOLD: ${{ env.NEW_DATA_THRESHOLD }}
+        run: python scripts/check_new_data.py
+
+  # ── Run training only if check-new-data says so ───────────────────────────────
+  train:
+    name: Retrain model
+    runs-on: ubuntu-latest
+    environment: production
+    needs: check-new-data
+    # Run if: (a) manually dispatched, OR (b) DB check says enough new data exists
+    if: |
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.check-new-data.outputs.should_train == 'true')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log trigger reason
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger: ${{ github.event.inputs.reason }}"
+          else
+            echo "Data threshold met: ${{ needs.check-new-data.outputs.new_row_count }} new rows"
+          fi
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      # Trigger a one-off K8s Job from the existing CronJob template
+      - name: Trigger training job
+        run: |
+          JOB_NAME="auto-train-$(date +%s)"
+          kubectl create job $JOB_NAME \
+            --from=cronjob/training-job \
+            --namespace=readmission
+
+          echo "Training job '$JOB_NAME' started"
+          echo "JOB_NAME=$JOB_NAME" >> $GITHUB_ENV
+
+      - name: Wait for training to complete
+        run: |
+          kubectl wait job/$JOB_NAME \
+            --for=condition=complete \
+            --namespace=readmission \
+            --timeout=3600s
+        continue-on-error: true
+
+      - name: Check job status
+        run: |
+          STATUS=$(kubectl get job $JOB_NAME -n readmission -o jsonpath='{.status.conditions[0].type}')
+          if [ "$STATUS" != "Complete" ]; then
+            echo "Training job failed or timed out. Status: $STATUS"
+            kubectl logs job/$JOB_NAME -n readmission --tail=50
+            exit 1
+          fi
+          echo "Training completed successfully"
+
+      - name: Fetch training logs
+        if: always()
+        run: kubectl logs job/$JOB_NAME -n readmission > training.log 2>&1 || true
+
+      - name: Upload training logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-logs-${{ github.run_id }}
+          path: training.log
+          retention-days: 30
+
+      - name: Restart API to load new model
+        if: success()
+        run: |
+          kubectl rollout restart deployment/api -n readmission
+          kubectl rollout status deployment/api -n readmission --timeout=180s
+
+      # ── Record this training run timestamp back to PostgreSQL ─────────────────
+      - name: Update last_training_run timestamp
+        if: success()
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+        run: |
+          pip install psycopg2-binary
+          python - <<'EOF'
+          import psycopg2, os
+          conn = psycopg2.connect(
+              host=os.environ["POSTGRES_HOST"],
+              user=os.environ["POSTGRES_USER"],
+              password=os.environ["POSTGRES_PASSWORD"],
+              dbname=os.environ["POSTGRES_DB"],
+          )
+          cur = conn.cursor()
+          cur.execute("""
+              INSERT INTO training_runs (triggered_by, status, created_at)
+              VALUES ('ct-workflow', 'complete', NOW())
+          """)
+          conn.commit()
+          cur.close()
+          conn.close()
+          print("Recorded training run timestamp")
+          EOF

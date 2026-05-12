@@ -1,0 +1,118 @@
+# ── Monitoring (Evidently) ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-service
+  namespace: readmission
+spec:
+  selector:
+    app: monitoring
+  ports:
+    - port: 8002
+      targetPort: 8002
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring
+  namespace: readmission
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monitoring
+  template:
+    metadata:
+      labels:
+        app: monitoring
+    spec:
+      containers:
+        - name: monitoring
+          image: ghcr.io/YOUR_ORG/readmission-monitoring:latest
+          ports:
+            - containerPort: 8002
+          envFrom:
+            - configMapRef:
+                name: readmission-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: readmission-secrets
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: reports
+              mountPath: /app/reports
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: reports
+          persistentVolumeClaim:
+            claimName: monitoring-reports-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: monitoring-reports-pvc
+  namespace: readmission
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+# ── Data validation (Great Expectations) ──────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-validation-service
+  namespace: readmission
+spec:
+  selector:
+    app: data-validation
+  ports:
+    - port: 8003
+      targetPort: 8003
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-validation
+  namespace: readmission
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-validation
+  template:
+    metadata:
+      labels:
+        app: data-validation
+    spec:
+      containers:
+        - name: data-validation
+          image: ghcr.io/YOUR_ORG/readmission-data-validation:latest
+          ports:
+            - containerPort: 8003
+          envFrom:
+            - configMapRef:
+                name: readmission-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: readmission-secrets
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
