@@ -1,0 +1,138 @@
+{
+  "project_name": "Hospital Readmission Prediction",
+  "version": "1.0.0",
+  "entity_id": "patient_nbr",
+  "target": {
+    "name": "readmit_30_days",
+    "type": "binary",
+    "description": "1 if patient was readmitted within 30 days, 0 otherwise",
+    "mapping": {
+      "0": "No Readmission",
+      "1": "Readmission < 30 Days"
+    }
+  },
+  "features": {
+    "categorical": [
+      {
+        "name": "race",
+        "dtype": "string",
+        "is_sensitive": true,
+        "allowed_values": ["Caucasian", "AfricanAmerican", "Other", "Unknown"],
+        "description": "Patient ethnicity"
+      },
+      {
+        "name": "gender",
+        "dtype": "string",
+        "is_sensitive": true,
+        "allowed_values": ["Female", "Male"],
+        "description": "Patient biological sex"
+      },
+      {
+        "name": "age_group",
+        "dtype": "string",
+        "is_sensitive": true,
+        "allowed_values": ["<30", "30-60", ">60"],
+        "description": "Binned age of the patient"
+      },
+      {
+        "name": "discharge_disposition",
+        "dtype": "string",
+        "allowed_values": ["Home", "Other"],
+        "description": "Where the patient was sent after discharge"
+      },
+      {
+        "name": "admission_source",
+        "dtype": "string",
+        "allowed_values": ["Emergency", "Referral", "Other"],
+        "description": "How the patient entered the hospital"
+      },
+      {
+        "name": "medical_specialty",
+        "dtype": "string",
+        "allowed_values": ["InternalMedicine", "Emergency/Trauma", "Family/GeneralPractice", "Cardiology", "Surgery", "Other", "Missing"],
+        "description": "Specialty of the admitting physician"
+      },
+      {
+        "name": "primary_diagnosis",
+        "dtype": "string",
+        "allowed_values": ["Circulatory", "Respiratory", "Diabetes", "Genitourinary", "Other", "Missing"],
+        "description": "Main clinical diagnosis based on ICD-9 codes"
+      },
+      {
+        "name": "max_glu_serum",
+        "dtype": "string",
+        "allowed_values": ["None", ">200", ">300", "Norm"],
+        "description": "Result of glucose serum test"
+      },
+      {
+        "name": "A1Cresult",
+        "dtype": "string",
+        "allowed_values": ["None", ">7", ">8", "Norm"],
+        "description": "Result of A1c test"
+      },
+      {
+        "name": "change",
+        "dtype": "string",
+        "allowed_values": ["No", "Ch"],
+        "description": "Whether there was a change in diabetic medications"
+      },
+      {
+        "name": "diabetesMed",
+        "dtype": "string",
+        "allowed_values": ["No", "Yes"],
+        "description": "Whether any diabetic medication was prescribed"
+      }
+    ],
+    "numerical": [
+      {
+        "name": "time_in_hospital",
+        "dtype": "integer",
+        "min": 1, "max": 14,
+        "description": "Days spent in hospital"
+      },
+      {
+        "name": "num_lab_procedures",
+        "dtype": "integer",
+        "description": "Number of lab tests performed"
+      },
+      {
+        "name": "num_procedures",
+        "dtype": "integer",
+        "description": "Number of non-lab procedures"
+      },
+      {
+        "name": "num_medications",
+        "dtype": "integer",
+        "description": "Number of distinct generic medications prescribed"
+      },
+      {
+        "name": "number_diagnoses",
+        "dtype": "integer",
+        "description": "Number of diagnoses entered into the system"
+      },
+      {
+        "name": "total_visits_last_year",
+        "dtype": "integer",
+        "is_engineered": true,
+        "description": "Sum of outpatient, emergency, and inpatient visits in the prior year"
+      },
+      {
+        "name": "severity_index",
+        "dtype": "integer",
+        "is_engineered": true,
+        "description": "Sum of medications, lab procedures, and number of diagnoses"
+      },
+      {
+        "name": "service_density",
+        "dtype": "float",
+        "is_engineered": true,
+        "description": "Ratio of procedures to time spent in hospital"
+      }
+    ]
+  },
+  "fairness_constraints": {
+    "target_metric": "equalized_odds_difference",
+    "maximum_allowed_disparity": 0.10,
+    "sensitive_features": ["race", "age_group"]
+  }
+}
