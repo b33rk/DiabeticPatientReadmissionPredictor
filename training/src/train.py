@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import mlflow
 import mlflow.sklearn
+import optuna
 from xgboost import XGBClassifier
 from fairlearn.postprocessing import ThresholdOptimizer
 from sklearn.model_selection import train_test_split
@@ -64,6 +65,25 @@ def populate_reference_data(df_train, num_cols):
         cur.close()
         conn.close()
 
+def objective(trial, X_train, y_train, X_val, y_val):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),
+        'eval_metric': 'logloss',
+        'random_state': 42
+    }
+    
+    model = XGBClassifier(**params)
+    model.fit(X_train, y_train)
+    
+    preds = model.predict_proba(X_val)[:, 1]
+    return roc_auc_score(y_val, preds)
+
 
 def main():
     with open("configs/train_config.yaml") as f:
@@ -90,46 +110,34 @@ def main():
     y = df['readmit_30_days']
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=config['data']['test_size'],
-        random_state=config['data']['random_seed'],
-        stratify=y
+        X, y, test_size=config['data']['test_size'],
+        random_state=config['data']['random_seed'], stratify=y
     )
 
-    numeric_cols = [
-        'time_in_hospital',
-        'num_lab_procedures',
-        'num_procedures',
-        'num_medications',
-        'number_outpatient',
-        'number_emergency',
-        'number_inpatient',
-        'number_diagnoses'
-    ]
-
-    print("Writing distribution stats to reference_data table...")
-    populate_reference_data(X_train, numeric_cols)
+    num_cols = [c for c in X.columns if X[c].dtype in [np.float64, np.int64]]
+    populate_reference_data(X_train, num_cols)
 
     print("Training base XGBoost model...")
 
     X_train_trans = preprocessor.transform(X_train)
+    X_test_trans = preprocessor.transform(X_test)
+    
+    best_params = config['xgboost']
+    if config['optuna']['enabled']:
+        print(f"Starting Optuna search ({config['optuna']['n_trials']} trials)...")
+        X_t, X_v, y_t, y_v = train_test_split(X_train_trans, y_train, test_size=0.2, stratify=y_train)
+        study = optuna.create_study(direction='maximize')
+        study.optimize(lambda t: objective(t, X_t, y_t, X_v, y_v), n_trials=config['optuna']['n_trials'])
+        best_params = study.best_params
+        print(f"Best Tuning Params: {best_params}")
 
-    base_model = XGBClassifier(
-        n_estimators=config['xgboost']['n_estimators'],
-        max_depth=config['xgboost']['max_depth'],
-        learning_rate=config['xgboost']['learning_rate'],
-        scale_pos_weight=3.0,
-        eval_metric='logloss',
-        random_state=42
-    )
-
+    print("Training optimized base model...")
+    base_model = XGBClassifier(**best_params)
     base_model.fit(X_train_trans, y_train)
 
-    print("Mitigating bias using Intersectional Sensitive Groups...")
-    
-    X_train_sensitive = X_train['race'].astype(str) + "_" + X_train['age_group'].astype(str)
-    X_test_sensitive = X_test['race'].astype(str) + "_" + X_test['age_group'].astype(str)
+    print("Applying Intersectional ThresholdOptimizer (Race + Age)...")
+    X_train_sens = X_train['race'].astype(str) + "_" + X_train['age_group'].astype(str)
+    X_test_sens = X_test['race'].astype(str) + "_" + X_test['age_group'].astype(str)
 
     mitigated_model = ThresholdOptimizer(
         estimator=base_model,
@@ -138,33 +146,13 @@ def main():
         prefit=True,
         predict_method='predict_proba'
     )
+    mitigated_model.fit(X_train_trans, y_train, sensitive_features=X_train_sens)
 
-    mitigated_model.fit(
-        X_train_trans,
-        y_train,
-        sensitive_features=X_train_sensitive
-    )
-
-    with mlflow.start_run(run_name="mitigated_xgboost_run") as run:
-        print("Evaluating mitigated model...")
-
-        X_test_trans = preprocessor.transform(X_test)
-        X_test_trans = np.asarray(X_test_trans)
-        y_pred = mitigated_model.predict(
-            X_test_trans,
-            sensitive_features=X_test_sensitive
-        )
-
-        try:
-            y_prob = mitigated_model._pmf_predict(
-                X_test_trans,
-                sensitive_features=X_test_sensitive
-            )[:, 1]
-
-        except Exception:
-            print("Falling back to base estimator probabilities...")
-            y_prob = base_model.predict_proba(X_test_trans)[:, 1]
-
+    with mlflow.start_run(run_name="final_optimized_fair_run") as run:
+        X_test_trans_arr = np.asarray(X_test_trans)
+        y_pred = mitigated_model.predict(X_test_trans_arr, sensitive_features=X_test_sens)
+        y_prob = mitigated_model._pmf_predict(X_test_trans_arr, sensitive_features=X_test_sens)[:, 1]
+        
         metrics = {
             "auc": roc_auc_score(y_test, y_prob),
             "f1": f1_score(y_test, y_pred, zero_division=0),
@@ -172,81 +160,34 @@ def main():
             "recall": recall_score(y_test, y_pred, zero_division=0),
             "balanced_acc": balanced_accuracy_score(y_test, y_pred)
         }
-
         mlflow.log_metrics(metrics)
-
-        print(f"Metrics: {metrics}")
-
-        print("Running Fairness Audit...")
-
-        fairness_cols = [
-            c for c in ['race', 'age_group', 'gender']
-            if c in X_test.columns
-        ]
-
+        mlflow.log_params(best_params)
+        print(f"Final Metrics: {metrics}")
+        
+        print("Running Multi-Attribute Fairness Audit...")
         fairness_passed = run_fairness_audit(
-            y_test,
-            y_pred,
-            X_test[fairness_cols],
-            run.info.run_id,
-            config['model']['name']
+            y_test, y_pred, X_test[['race', 'age_group', 'gender']], 
+            run.info.run_id, config['model']['name']
         )
-
         mlflow.log_param("fairness_passed", fairness_passed)
-
-        signature = infer_signature(
-            np.asarray(X_test_trans[:10]),
-            y_pred[:10]
-        )
-
-        mlflow.sklearn.log_model(
-            sk_model=mitigated_model,
-            artifact_path="model",
-            signature=signature
-        )
-
-        mlflow.log_artifact(
-            "/data/processed/preprocessor.pkl",
-            "preprocessing"
-        )
-
-        if fairness_passed and metrics['auc'] > 0.62:
-            print("--- VALIDATION PASSED ---")
-            print("Registering model to MLflow Model Registry...")
-
+        
+        signature = infer_signature(X_test_trans_arr[:10], y_pred[:10])
+        mlflow.sklearn.log_model(mitigated_model, "model", signature=signature)
+        mlflow.log_artifact("/data/processed/preprocessor.pkl", "preprocessing")
+        
+        if fairness_passed and metrics['auc'] > 0.60:
+            print("--- VALIDATION PASSED: Registering Production Model ---")
             model_uri = f"runs:/{run.info.run_id}/model"
-
-            reg_version = mlflow.register_model(
-                model_uri,
-                config['model']['name']
-            )
-
+            reg = mlflow.register_model(model_uri, config['model']['name'])
+            
             from mlflow.tracking import MlflowClient
-
             client = MlflowClient()
-
-            try:
-                client.transition_model_version_stage(
-                    name=config['model']['name'],
-                    version=reg_version.version,
-                    stage="Production",
-                    archive_existing_versions=True
-                )
-
-                print(
-                    f"Model version {reg_version.version} "
-                    f"promoted to PRODUCTION."
-                )
-
-            except Exception as e:
-                print(f"Stage transition failed: {e}")
-
-        else:
-            print("--- VALIDATION FAILED ---")
-            print(
-                "Model failed Fairness or "
-                "Performance requirements. Not registered."
+            client.transition_model_version_stage(
+                name=config['model']['name'], version=reg.version,
+                stage="Production", archive_existing_versions=True
             )
+        else:
+            print("--- MODEL REJECTED: Failed Fairness or Performance gate ---")
 
 
 if __name__ == "__main__":

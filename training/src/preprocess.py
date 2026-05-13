@@ -11,46 +11,46 @@ def clean_data(df):
     df['readmit_30_days'] = (df['readmitted'] == '<30').astype(int)
 
     df = df[df['gender'] != 'Unknown/Invalid'].copy()
-    
     age_map = {
         '[0-10)': '<30', '[10-20)': '<30', '[20-30)': '<30',
         '[30-40)': '30-60', '[40-50)': '30-60', '[50-60)': '30-60',
         '[60-70)': '>60', '[70-80)': '>60', '[80-90)': '>60', '[90-100)': '>60'
     }
     df['age_group'] = df['age'].map(age_map)
-    
-    df['race'] = df['race'].replace('?', 'Unknown')
-    df['race'] = df['race'].replace(['Asian', 'Hispanic', 'Other'], 'Other')
+    df['race'] = df['race'].replace('?', 'Unknown').replace(['Asian', 'Hispanic', 'Other'], 'Other')
 
     df['discharge_disposition'] = df['discharge_disposition_id'].apply(lambda x: 'Home' if x == 1 else 'Other')
-    df['admission_source'] = df['admission_source_id'].apply(lambda x: 'Emergency' if x == 7 else ('Referral' if x in [1, 2, 3] else 'Other'))
+    
+    df['admission_source'] = df['admission_source_id'].apply(
+        lambda x: 'Emergency' if x == 7 else ('Referral' if x in [1, 2, 3] else 'Other')
+    )
+    
     df['medical_specialty'] = df['medical_specialty'].replace('?', 'Missing')
     
+    df['total_visits_last_year'] = df['number_outpatient'] + df['number_emergency'] + df['number_inpatient']
+    df['severity_index'] = df['num_medications'] + df['num_lab_procedures'] + df['number_diagnoses']
+    df['service_density'] = df['num_procedures'] / (df['time_in_hospital'] + 1)
+
     def map_diag(code):
         if str(code) == '?': return 'Missing'
-        if 'V' in str(code) or 'E' in str(code): return 'Other'
+        if '250' in str(code): return 'Diabetes'
         try:
             icd = float(code)
             if 390 <= icd <= 459 or icd == 785: return 'Circulatory'
             if 460 <= icd <= 519 or icd == 786: return 'Respiratory'
-            if 520 <= icd <= 579 or icd == 787: return 'Digestive'
-            if np.floor(icd) == 250: return 'Diabetes'
-            if 800 <= icd <= 999: return 'Injury'
-            if 710 <= icd <= 739: return 'Musculoskeletal'
             if 580 <= icd <= 629 or icd == 788: return 'Genitourinary'
-            if 140 <= icd <= 239: return 'Neoplasms'
             return 'Other'
-        except:
-            return 'Other'
+        except: return 'Other'
             
     df['primary_diagnosis'] = df['diag_1'].apply(map_diag)
     
-    cols =[
+    cols = [
         'patient_nbr', 'race', 'gender', 'age_group',
         'discharge_disposition', 'admission_source', 'medical_specialty',
         'primary_diagnosis', 'max_glu_serum', 'A1Cresult', 'change', 'diabetesMed',
         'time_in_hospital', 'num_lab_procedures', 'num_procedures', 'num_medications',
         'number_outpatient', 'number_emergency', 'number_inpatient', 'number_diagnoses',
+        'total_visits_last_year', 'severity_index', 'service_density',
         'readmit_30_days'
     ]
     return df[cols]

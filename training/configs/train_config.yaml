@@ -25,10 +25,9 @@ smote:
   enabled: false
 
 optuna:
-  enabled: false               # set to true to run hyperparameter search
-  n_trials: 50
-  timeout: 3600
-
+  enabled: true
+  n_trials: 20
+  
 mlflow:
   experiment_name: readmission-prediction
   run_tags:

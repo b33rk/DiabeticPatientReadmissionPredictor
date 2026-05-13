@@ -12,3 +12,4 @@ fairlearn==0.10.0
 aif360==0.6.1
 joblib==1.4.0
 pyyaml==6.0.1
+optuna==3.6.1
