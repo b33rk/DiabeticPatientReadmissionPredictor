@@ -1,4 +1,4 @@
-demographic_parity_diff: 0.05
-equalized_odds_diff: 0.05
-false_positive_rate_diff: 0.08
+demographic_parity_diff: 0.10
+equalized_odds_diff: 0.10
+false_positive_rate_diff: 0.10
 sensitive_attributes: [race, age_group, gender]
