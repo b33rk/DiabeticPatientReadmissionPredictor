@@ -244,6 +244,7 @@ services:
       context: ./training
       dockerfile: Dockerfile
     environment:
+      PYTHONPATH: /app
       MLFLOW_TRACKING_URI: http://mlflow:5000
       POSTGRES_HOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-readmission}
@@ -252,6 +253,9 @@ services:
       REDIS_HOST: redis
     volumes:
       - ./data:/data
+      - ./fairness:/app/fairness              
+      - ./training/configs:/app/configs       
+      - ./training/src:/app/src               
     networks:
       - app-network
     depends_on:
